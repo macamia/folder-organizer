@@ -22,7 +22,7 @@ import tkinter as tk
 from tkinter import filedialog, font, messagebox, simpledialog, ttk
 
 from matlab_dependencies import Analysis, AnalysisRequest, analyze_matlab, dependency_report, find_matlab
-from matlab_version_diff import change_blocks, code_line_match_rate
+from matlab_version_diff import change_blocks, code_line_match_rate, matlab_code_lines, python_code_lines
 
 
 TITLE = "フォルダ仕分け"
@@ -30,6 +30,10 @@ BACKUP = "backup"
 LEGACY_BACKUP = "バックアップ"
 TEXT_TYPES = {".m", ".py", ".txt", ".md", ".csv"}
 CODE_TYPES = {".m", ".mlx", ".py"}
+CODE_NORMALIZERS = {".m": matlab_code_lines, ".py": python_code_lines}
+NAME_CANDIDATE_RATE = 0.75
+CODE_CANDIDATE_RATE = 0.75
+BACKUP_CHECK_RATE = 0.85
 DOCUMENT_TYPES = {".pdf", ".pptx", ".ppt", ".docx", ".doc", ".xlsx", ".xls"}
 SUPPORTED = TEXT_TYPES | CODE_TYPES | DOCUMENT_TYPES
 TEXT_LIMIT = 256 * 1024
@@ -43,6 +47,7 @@ VERSION = re.compile(
 )
 INVALID_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]|[. ]$')
 RESERVED_NAME = re.compile(r"(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])(?:\.|$)", re.IGNORECASE)
+NAME_SEPARATORS = re.compile(r"[\s_.-]+")
 
 
 def stem_without_version(stem: str) -> str:
@@ -69,6 +74,7 @@ class File:
     text: str | None
     digest: bytes | None
     shingles: frozenset[tuple[str, str, str]]
+    code_lines: tuple[str, ...]
 
     @property
     def ext(self) -> str:
@@ -85,7 +91,9 @@ def inspect_file(path: Path) -> File:
         raise OSError("通常のファイルではありません。")
     text, digest = None, None
     shingles = frozenset()
-    if path.suffix.casefold() in TEXT_TYPES and info.st_size <= TEXT_LIMIT:
+    code_lines = ()
+    extension = path.suffix.casefold()
+    if extension in TEXT_TYPES and info.st_size <= TEXT_LIMIT:
         with path.open("rb") as stream:
             data = stream.read(TEXT_LIMIT + 1)
         if len(data) <= TEXT_LIMIT:
@@ -100,19 +108,33 @@ def inspect_file(path: Path) -> File:
                     text = decoded
                 break
             if text is not None:
-                lines = [line.strip() for line in text.splitlines() if line.strip()]
-                if len(lines) >= 8:
-                    shingles = frozenset(zip(lines, lines[1:], lines[2:]))
-    return File(path, file_stamp(info), text, digest, shingles)
+                if extension in CODE_NORMALIZERS:
+                    code_lines = CODE_NORMALIZERS[extension](text)
+                else:
+                    lines = [line.strip() for line in text.splitlines() if line.strip()]
+                    if len(lines) >= 8:
+                        shingles = frozenset(zip(lines, lines[1:], lines[2:]))
+    return File(path, file_stamp(info), text, digest, shingles, code_lines)
 
 
-def similarity(left: File, right: File) -> float | None:
+def similarity(left: File, right: File, minimum: float = 0.0) -> float | None:
     if left.digest is not None and left.digest == right.digest:
         return 1.0
+    if left.ext == right.ext and left.ext in CODE_NORMALIZERS:
+        if left.text is None or right.text is None:
+            return None
+        return code_line_match_rate(left.code_lines, right.code_lines, minimum)
     if left.shingles and right.shingles:
         shared = len(left.shingles & right.shingles)
         return shared / (len(left.shingles) + len(right.shingles) - shared)
     return None
+
+
+def name_similarity(left: File, right: File) -> float:
+    first, second = sorted((NAME_SEPARATORS.sub("", left.stem), NAME_SEPARATORS.sub("", right.stem)))
+    if first:
+        return difflib.SequenceMatcher(None, first, second, autojunk=False).ratio()
+    return float(left.stem == right.stem)
 
 
 def office_lines(path: Path) -> list[str]:
@@ -213,8 +235,10 @@ def grouped_with(left: File, right: File) -> bool:
         return False
     if left.stem == right.stem:
         return True
-    score = similarity(left, right)
-    return score is not None and score >= 0.75
+    if left.ext in CODE_TYPES and name_similarity(left, right) >= NAME_CANDIDATE_RATE:
+        return True
+    score = similarity(left, right, CODE_CANDIDATE_RATE)
+    return score is not None and score >= CODE_CANDIDATE_RATE
 
 
 def scan_paths(folder: Path, include_subfolders: bool, on_error):
@@ -254,7 +278,9 @@ def scan(folder: Path, include_subfolders: bool = False) -> tuple[list[list[File
             skipped += 1
             continue
         for group in groups:
-            if all(grouped_with(item, other) for other in group):
+            # Keep the first file as the anchor so a chain of matches cannot grow the group.
+            anchors = group[:1] if item.ext in CODE_TYPES else group
+            if all(grouped_with(item, other) for other in anchors):
                 group.append(item)
                 break
         else:
@@ -286,11 +312,6 @@ def find_representatives(folder: Path, group: list[File]) -> tuple[list[tuple[Fi
     for item in group:
         by_size.setdefault(item.stamp[2], []).append(item)
 
-    def code_lines(item):
-        return [line.strip() for line in (item.text or "").splitlines() if line.strip()]
-
-    baselines = [(item, code_lines(item)) for item in group]
-
     def skip(_error):
         nonlocal skipped
         skipped += 1
@@ -305,18 +326,17 @@ def find_representatives(folder: Path, group: list[File]) -> tuple[list[tuple[Fi
         except OSError as error:
             skip(error)
             continue
-        lines = code_lines(candidate)
-        score = 0.0
-        for item, base in baselines:
-            score = max(score, similarity(candidate, item) or 0)
-            if min(len(lines), len(base)) >= 4:
-                matcher = difflib.SequenceMatcher(None, base, lines, autojunk=max(len(lines), len(base)) > 2000)
-                if matcher.quick_ratio() >= 0.75:
-                    score = max(score, matcher.ratio())
-        same_name = any(candidate.stem == item.stem for item in group)
-        if identical or score >= 0.75 or same_name:
-            reason = "完全一致" if identical else f"内容の類似度 {score:.0%}" if score >= 0.75 else "同系統の名前"
-            matches.append((not identical, -score, not same_name, str(path).casefold(), candidate, reason))
+        score = max(similarity(candidate, item, CODE_CANDIDATE_RATE) or 0 for item in group)
+        name_score = max(name_similarity(candidate, item) for item in group)
+        if identical:
+            reason = "完全一致"
+        elif score >= CODE_CANDIDATE_RATE:
+            reason = f"コードの行一致率 {score:.0%}"
+        elif name_score >= NAME_CANDIDATE_RATE:
+            reason = f"ファイル名の類似度 {name_score:.0%}（要確認）"
+        else:
+            continue
+        matches.append((not identical, -score, -name_score, str(path).casefold(), candidate, reason))
     matches.sort(key=lambda row: row[:4])
     return [(row[4], row[5]) for row in matches], skipped
 
@@ -540,7 +560,7 @@ class Organizer(tk.Tk):
             if face.casefold() in families:
                 font.nametofont("TkFixedFont", self).configure(family=families[face.casefold()], size=10)
                 break
-        self.title(f"{TITLE} 0.12")
+        self.title(f"{TITLE} 0.13")
         self.geometry("1050x690")
         self.minsize(800, 540)
         self.folder: Path | None = None
@@ -813,11 +833,11 @@ class Organizer(tk.Tk):
 
     def choose_representative(self):
         item, = self.checked_files()
+        if item.ext in CODE_TYPES:
+            self.review_representative(self.group, item)
+            return
         prompt = "代表として残すファイル名を入力してください。"
         suggested = stem_without_version(item.path.stem) + item.path.suffix
-        if item.ext in CODE_TYPES:
-            suggested = item.path.name
-            prompt += "\nコードの名前や配置を変えると、呼び出しに影響する場合があります。"
         name = simpledialog.askstring(TITLE, prompt, initialvalue=suggested, parent=self)
         if name is not None:
             self.preview(item, name.strip())
@@ -977,7 +997,7 @@ class Organizer(tk.Tk):
             group = destinations[destination.current()]
             representative = candidates[selected[0]][0]
             window.destroy()
-            self.review_import(group, representative)
+            self.review_representative(group, representative)
 
         choose_button = ttk.Button(sources, text="ファイルを選ぶ", command=choose_file)
         choose_button.pack(side="left")
@@ -992,7 +1012,7 @@ class Organizer(tk.Tk):
         choices.bind("<<ListboxSelect>>", update_choices)
         update_choices()
 
-    def review_import(self, group, representative):
+    def review_representative(self, group, representative):
         window = tk.Toplevel(self)
         window.title("代表版と既存の版を比較")
         window.transient(self)
@@ -1006,7 +1026,8 @@ class Organizer(tk.Tk):
         ttk.Label(naming, text="残すファイル名").pack(side="left", padx=(0, 8))
         filename = tk.StringVar(window, value=representative.path.name)
         ttk.Entry(naming, textvariable=filename, width=55).pack(side="left", fill="x", expand=True)
-        ttk.Label(frame, text="バックアップに移す版にチェックを付けます。").pack(anchor="w", pady=(10, 3))
+        ttk.Label(frame, text=f"完全一致または行一致率{BACKUP_CHECK_RATE:.0%}以上の版に初期チェックが入ります。"
+                             "\nバックアップに移す版を確認してください。").pack(anchor="w", pady=(10, 3))
         listing = ttk.Frame(frame)
         listing.pack(fill="both", expand=True)
         listing.columnconfigure(0, weight=1)
@@ -1028,23 +1049,25 @@ class Organizer(tk.Tk):
         for item in group:
             if item.path == representative.path:
                 continue
-            variable = tk.BooleanVar(window, value=True)
-            checks[item.path] = variable
             try:
                 identical = (item.stamp[2] == representative.stamp[2]
                              and content_digest(item, cache) == content_digest(representative, cache))
             except OSError:
                 identical = False
-            rate = None
+            rate = similarity(representative, item) if not identical else None
             if representative.text is not None and item.text is not None:
                 pairs.append((representative, item))
                 if identical:
                     summary = "完全一致"
                 else:
-                    rate = code_line_match_rate(representative.text, item.text, item.ext)
                     summary = f"行一致率 {rate:.1%}" if rate is not None else "比較できるコード行がありません"
             else:
                 summary = "完全一致" if identical else "本文の差分を表示できない形式またはサイズ"
+            checked = identical or (rate is not None and rate >= BACKUP_CHECK_RATE)
+            variable = tk.BooleanVar(window, value=checked)
+            checks[item.path] = variable
+            if not checked and name_similarity(representative, item) >= NAME_CANDIDATE_RATE:
+                summary += " / 名前が近い（要確認）"
             ttk.Checkbutton(rows, text=f"{item.path.name}   {summary}", variable=variable).pack(anchor="w", pady=2)
             if rate is not None and rate < 0.5:
                 ttk.Label(rows, text="内容の差が大きく、役割や処理が異なる可能性があります。",
@@ -1066,7 +1089,7 @@ class Organizer(tk.Tk):
         if pairs:
             ttk.Button(actions, text="差分の詳細", command=lambda: self.show_diff_details(pairs, window)).pack(side="left")
         ttk.Button(actions, text="キャンセル", command=window.destroy).pack(side="right")
-        ttk.Button(actions, text="バックアップに移す", command=proceed).pack(side="right", padx=6)
+        ttk.Button(actions, text="整理内容を確認", command=proceed).pack(side="right", padx=6)
 
     def set_detail_pairs(self, pairs):
         self.detail_pairs = pairs
@@ -1372,7 +1395,8 @@ class Organizer(tk.Tk):
             return
         score = similarity(left, right)
         if score is not None:
-            heading += f"   行パターンの類似度 {score:.0%}"
+            label = "コードの行一致率" if left.ext in CODE_NORMALIZERS else "行パターンの類似度"
+            heading += f"   {label} {score:.0%}"
         diff = list(difflib.unified_diff(*versions, self.file_name(left), self.file_name(right), lineterm=""))
         if len(diff) > 1500:
             diff = diff[:1500] + ["", "表示は先頭1500行までです。"]

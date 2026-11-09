@@ -1,33 +1,94 @@
-"""MATLABファイルの行差分を、共通する処理を目印にまとめる。"""
+"""コードの比較用に行を整え、差分のまとまりを求める。"""
 
 from collections import Counter
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from io import StringIO
 import re
+import tokenize
 
 ASSIGNMENT = re.compile(r"^\s*([A-Za-z]\w*)\s*=(?!=)\s*(.*)$")
 CONTROL = re.compile(r"^\s*(for|parfor|if|elseif|while|switch|case|break|return)\b")
+MATLAB_MARKERS = re.compile(r"""['"%]|\.\.\.""")
+MATLAB_STRINGS = {
+    "'": re.compile(r"'(?:''|[^'])*'"),
+    '"': re.compile(r'"(?:""|[^"])*"'),
+}
 
 
-def code_line_match_rate(left: str, right: str, extension: str) -> float | None:
-    def code_lines(text):
-        lines = []
-        in_comment = False
-        prefix = "#" if extension == ".py" else "%"
-        for raw in text.splitlines():
-            line = raw.strip()
-            if extension == ".m" and line == "%{":
-                in_comment = True
-            elif extension == ".m" and line == "%}":
-                in_comment = False
-            elif not in_comment and line and not line.startswith(prefix):
-                lines.append(line)
-        return lines
+def matlab_line(line: str) -> tuple[str, bool]:
+    position = 0
+    while marker := MATLAB_MARKERS.search(line, position):
+        symbol = marker[0]
+        start = marker.start()
+        if symbol == "%":
+            return line[:start].rstrip(), False
+        if symbol == "...":
+            return line[:start].rstrip(), True
+        position = marker.end()
+        previous = line[start - 1] if start else ""
+        # An apostrophe attached to an operand can be a transpose operator.
+        if symbol == "'" and previous and (previous.isalnum() or previous in "_)]}.'"):
+            continue
+        literal = MATLAB_STRINGS[symbol].match(line, start)
+        if literal is None:
+            break
+        position = literal.end()
+    return line, False
 
-    first, second = code_lines(left), code_lines(right)
+
+def matlab_code_lines(text: str) -> tuple[str, ...]:
+    lines = []
+    continued_parts = []
+    block_depth = 0
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line == "%{":
+            block_depth += 1
+        elif line == "%}" and block_depth:
+            block_depth -= 1
+        elif line and not block_depth:
+            code, continues = matlab_line(line)
+            if code:
+                continued_parts.append(code)
+                if not continues:
+                    lines.append(" ".join(continued_parts))
+                    continued_parts.clear()
+    if continued_parts:
+        lines.append(" ".join(continued_parts))
+    return tuple(lines)
+
+
+def python_code_lines(text: str) -> tuple[str, ...]:
+    lines = []
+    tokens = []
+    depth = 0
+    try:
+        for token in tokenize.generate_tokens(StringIO(text, newline=None).readline):
+            if token.type == tokenize.INDENT:
+                depth += 1
+            elif token.type == tokenize.DEDENT:
+                depth -= 1
+            elif token.type == tokenize.NEWLINE:
+                if tokens:
+                    lines.append(repr((depth, tokens)))
+                    tokens.clear()
+            elif token.type not in {tokenize.COMMENT, tokenize.NL, tokenize.ENDMARKER}:
+                tokens.append(token.string)
+    except (tokenize.TokenError, SyntaxError):
+        return ()
+    return tuple(lines)
+
+
+def code_line_match_rate(first: tuple[str, ...], second: tuple[str, ...],
+                         minimum: float = 0.0) -> float | None:
     if not first and not second:
         return None
-    return SequenceMatcher(None, first, second, autojunk=max(len(first), len(second)) > 2000).ratio()
+    first, second = sorted((first, second))
+    matcher = SequenceMatcher(None, first, second, autojunk=max(len(first), len(second)) > 2000)
+    if minimum and matcher.quick_ratio() < minimum:
+        return 0.0
+    return matcher.ratio()
 
 
 @dataclass(frozen=True)
